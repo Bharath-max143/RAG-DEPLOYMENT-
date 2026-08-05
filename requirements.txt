@@ -1,6 +1,5 @@
 google.generativeai
 dotenv
-os
 langserve
 fastapi
 uvicorn
@@ -11,3 +10,4 @@ langchain_text_splitters
 langchain_community
 faiss
 langchain
+sse_starlette
