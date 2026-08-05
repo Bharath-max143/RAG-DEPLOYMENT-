@@ -1,0 +1,9 @@
+google.generativeai
+ChatGoogleGenerativeAI
+ChatPromptTemplate
+langchain_core
+langchain_google_genai
+langchain_community
+faiss
+langchain.tools
+angchain.agents
