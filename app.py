@@ -1,894 +1,467 @@
 import os
-import uvicorn
-
+import re
+import sys
+import asyncio
 from typing import TypedDict
 
-from fastapi import FastAPI
+# Ensure UTF-8 console output on Windows
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import uvicorn
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-
 from langgraph.graph import StateGraph, END
 
 
-# ============================================================
-# GOOGLE API KEY
-# ============================================================
+# ---------- CONFIG ----------
+API_KEY = os.getenv("GOOGLE_API_KEY", "AQ.Ab8RN6JrvCpgQt5md4rw9ZounGOuD9FVS9BbveST4eI472VBvA")
+if not API_KEY:
+    raise RuntimeError("Set GOOGLE_API_KEY before starting the app.")
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY environment variable is not set.")
-
-
-# ============================================================
-# LLM
-# ============================================================
+# gemini-3.1-flash-lite is the active fast model
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+TIMEOUT = 60  # seconds per AI call
 
 llm = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0
+    model=MODEL,
+    google_api_key=API_KEY,
+    temperature=0,
+    max_output_tokens=2048,
+    timeout=TIMEOUT,
+    max_retries=2,
 )
 
 
-# ============================================================
-# HELPER
-# ============================================================
-
-def content_to_text(content):
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-
-        parts = []
-
-        for item in content:
-
-            if isinstance(item, str):
-                parts.append(item)
-
-            elif isinstance(item, dict):
-
-                if "text" in item:
-                    parts.append(str(item["text"]))
-
-                elif "content" in item:
-                    parts.append(str(item["content"]))
-
-            elif hasattr(item, "text"):
-                parts.append(str(item.text))
-
-        return "\n".join(parts)
-
-    if isinstance(content, dict):
-
-        if "text" in content:
-            return str(content["text"])
-
-        if "content" in content:
-            return str(content["content"])
-
-    return str(content)
-
-
-# ============================================================
-# LANGGRAPH STATE
-# ============================================================
-
-class DevCrewState(TypedDict, total=False):
-
+# ---------- STATE ----------
+class CrewState(TypedDict, total=False):
     user_task: str
-
     plan: str
-
     code: str
-
     tests: str
-
     review: str
-
     final_solution: str
 
 
-# ============================================================
-# AGENT 1 - PLANNER
-# ============================================================
+def ask(prompt: str, **values) -> str:
+    """Run one short AI request and return its text."""
+    chain = ChatPromptTemplate.from_template(prompt) | llm
+    result = chain.invoke(values)
+    content = result.content
 
-def planner_agent(state: DevCrewState):
-
-    prompt = ChatPromptTemplate.from_template("""
-You are the PLANNER AGENT in an AI software development crew.
-
-The user has given this development task:
-
-{user_task}
-
-Your job is to understand the requirement and create a
-clear implementation plan.
-
-Include:
-
-1. Problem understanding
-2. Required features
-3. Technologies to use
-4. File structure
-5. Step-by-step implementation
-6. Important edge cases
-
-Do NOT write the complete code yet.
-
-Keep the plan practical and clear.
-""")
-
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "user_task": state["user_task"]
-    })
-
-    return {
-        "plan": content_to_text(response.content)
-    }
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", str(item))
+            if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
 
 
-# ============================================================
-# AGENT 2 - DEVELOPER
-# ============================================================
+# ---------- AGENT 1: PLANNER ----------
+def planner(state: CrewState):
+    print("\n" + "=" * 70)
+    print("🧠 [AGENT 1: PLANNER] Generating implementation plan...")
+    print("=" * 70)
+    result = ask(
+        """You are a SOFTWARE PLANNER, not a career assistant.
+Task: {task}
 
-def developer_agent(state: DevCrewState):
+Create a concise implementation plan with:
+features, technology, file structure, and key edge cases.
+Maximum 180 words. Do not write the complete code.""",
+        task=state["user_task"],
+    )
+    print(result.strip())
+    return {"plan": result}
 
-    prompt = ChatPromptTemplate.from_template("""
-You are the DEVELOPER AGENT in an AI software development crew.
 
-USER TASK:
-{user_task}
+# ---------- AGENT 2: DEVELOPER ----------
+def developer(state: CrewState):
+    print("\n" + "=" * 70)
+    print("💻 [AGENT 2: DEVELOPER] Generating code...")
+    print("=" * 70)
+    result = ask(
+        """You are a SOFTWARE DEVELOPER.
+Implement only the user's requested software task.
 
-PLANNER'S PLAN:
+TASK:
+{task}
+
+PLAN:
 {plan}
 
-Your job is to implement the solution.
-
-Generate the actual code required for the task.
-
-Requirements:
-
-- Follow the planner's design.
-- Write clean and readable code.
-- Include necessary imports.
-- Handle errors properly.
-- Do not leave important parts as TODO.
-- If multiple files are required, clearly separate them
-  using filenames.
-
-Return the implementation/code only with minimal explanation.
-""")
-
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "user_task": state["user_task"],
-        "plan": state["plan"]
-    })
-
-    return {
-        "code": content_to_text(response.content)
-    }
+Return runnable code with filenames if multiple files are needed.
+Include imports and essential error handling.
+Avoid lengthy explanations and unrelated features.
+Never answer with resume analysis or career advice.""",
+        task=state["user_task"],
+        plan=state["plan"],
+    )
+    print(result.strip())
+    return {"code": result}
 
 
-# ============================================================
-# AGENT 3 - TESTER
-# ============================================================
+# ---------- AGENT 3: TESTER ----------
+def tester(state: CrewState):
+    print("\n" + "=" * 70)
+    print("🧪 [AGENT 3: TESTER] Auditing code & generating tests...")
+    print("=" * 70)
+    result = ask(
+        """You are a SOFTWARE TESTER.
+Task: {task}
 
-def tester_agent(state: DevCrewState):
-
-    prompt = ChatPromptTemplate.from_template("""
-You are the TESTER AGENT in an AI software development crew.
-
-USER TASK:
-{user_task}
-
-IMPLEMENTATION:
+CODE:
 {code}
 
-Your job is to test and analyze the implementation.
-
-Check for:
-
-1. Syntax problems
-2. Logical errors
-3. Missing functionality
-4. Edge cases
-5. Security problems
-6. Incorrect imports
-7. Runtime issues
-8. API or integration issues
-
-Then provide:
-
-- Problems found
-- Why they are problems
-- How to fix them
-- Test cases that should be executed
-
-If the implementation looks correct, clearly state that
-and provide useful test cases.
-""")
-
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "user_task": state["user_task"],
-        "code": state["code"]
-    })
-
-    return {
-        "tests": content_to_text(response.content)
-    }
+Find only important syntax, logic, security, and requirement issues.
+Give up to 5 concrete test cases and the necessary fixes.
+Do NOT claim tests were executed; you have not run the code.
+Maximum 250 words.""",
+        task=state["user_task"],
+        code=state["code"],
+    )
+    print(result.strip())
+    return {"tests": result}
 
 
-# ============================================================
-# AGENT 4 - REVIEWER
-# ============================================================
-
-def reviewer_agent(state: DevCrewState):
-
-    prompt = ChatPromptTemplate.from_template("""
-You are the REVIEWER AGENT in an AI software development crew.
+# ---------- AGENT 4: REVIEWER + FINAL SOLUTION ----------
+def reviewer(state: CrewState):
+    print("\n" + "=" * 70)
+    print("🔍 [AGENT 4: REVIEWER & FINAL SOLUTION] Reviewing and finalizing...")
+    print("=" * 70)
+    result = ask(
+        """You are the SOFTWARE REVIEWER and FINAL CODE EDITOR.
 
 USER TASK:
-{user_task}
+{task}
 
-PLANNER:
+PLAN:
 {plan}
 
-DEVELOPER CODE:
+IMPLEMENTATION:
 {code}
 
 TESTER REPORT:
 {tests}
 
-Review the complete solution.
+Return these sections:
+1. REVIEW: short list of important defects and fixes.
+2. FINAL SOLUTION: corrected, complete code, with filenames if needed.
+3. RUN: short setup and run commands.
 
-Check:
+Follow the user's task exactly. Do not generate career guidance,
+resume analysis, job recommendations, or unrelated content.
+Do not claim that code was executed unless it actually was.
+Keep explanations concise but code complete.""",
+        task=state["user_task"],
+        plan=state["plan"],
+        code=state["code"],
+        tests=state["tests"],
+    )
+    print(result.strip())
 
-1. Does the code satisfy the user's requirement?
-2. Is the architecture reasonable?
-3. Is the code maintainable?
-4. Are there bugs?
-5. Are there missing features?
-6. Are the tester's concerns valid?
-7. What should be improved?
-
-Provide a final review with:
-
-- Strengths
-- Problems
-- Required fixes
-- Optional improvements
-""")
-
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "user_task": state["user_task"],
-        "plan": state["plan"],
-        "code": state["code"],
-        "tests": state["tests"]
-    })
-
-    return {
-        "review": content_to_text(response.content)
-    }
-
-
-# ============================================================
-# AGENT 5 - FINAL SOLUTION
-# ============================================================
-
-def final_solution_agent(state: DevCrewState):
-
-    prompt = ChatPromptTemplate.from_template("""
-You are the FINAL SOLUTION AGENT.
-
-You are responsible for producing the final answer for the
-software development task.
-
-USER TASK:
-{user_task}
-
-PLANNER:
-{plan}
-
-DEVELOPER:
-{code}
-
-TESTER:
-{tests}
-
-REVIEWER:
-{review}
-
-Create the final solution.
-
-Rules:
-
-1. Apply the important fixes identified by the tester
-   and reviewer.
-2. Provide complete code.
-3. Clearly show filenames when multiple files are needed.
-4. Do not include incomplete TODO sections.
-5. Keep the implementation practical.
-6. Briefly explain how to run the solution.
-
-Your response must be useful for a developer who wants to
-actually implement the project.
-""")
-
-    chain = prompt | llm
-
-    response = chain.invoke({
-        "user_task": state["user_task"],
-        "plan": state["plan"],
-        "code": state["code"],
-        "tests": state["tests"],
-        "review": state["review"]
-    })
-
-    return {
-        "final_solution": content_to_text(response.content)
-    }
-
-
-# ============================================================
-# LANGGRAPH WORKFLOW
-# ============================================================
-
-builder = StateGraph(DevCrewState)
-
-
-builder.add_node(
-    "planner",
-    planner_agent
-)
-
-builder.add_node(
-    "developer",
-    developer_agent
-)
-
-builder.add_node(
-    "tester",
-    tester_agent
-)
-
-builder.add_node(
-    "reviewer",
-    reviewer_agent
-)
-
-builder.add_node(
-    "final_solution",
-    final_solution_agent
-)
-
-
-# ============================================================
-# WORKFLOW CONNECTIONS
-# ============================================================
-
-builder.set_entry_point("planner")
-
-builder.add_edge(
-    "planner",
-    "developer"
-)
-
-builder.add_edge(
-    "developer",
-    "tester"
-)
-
-builder.add_edge(
-    "tester",
-    "reviewer"
-)
-
-builder.add_edge(
-    "reviewer",
-    "final_solution"
-)
-
-builder.add_edge(
-    "final_solution",
-    END
-)
-
-
-graph = builder.compile()
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="LangGraph AI Dev Crew",
-    version="1.0"
-)
-
-
-# ============================================================
-# API
-# ============================================================
-
-@app.post("/dev-crew")
-async def run_dev_crew(data: dict):
-
-    user_task = data.get("task", "").strip()
-
-    if not user_task:
-
+    # Robust regex separation for FINAL SOLUTION header in various markdown formats
+    match = re.search(r'(?:^|\n)(?:[#*`\d.\s-]*)FINAL\s+SOLUTION\s*:?[#*`\s]*\n', result, re.IGNORECASE)
+    if match:
+        review_text = result[:match.start()].strip()
+        final_text = result[match.end():].strip()
         return {
-            "success": False,
-            "error": "Please enter a development task."
+            "review": review_text,
+            "final_solution": final_text,
         }
 
-    initial_state = {
-        "user_task": user_task
+    # Inline fallback
+    marker_match = re.search(r'FINAL\s+SOLUTION\s*:', result, re.IGNORECASE)
+    if marker_match:
+        review_text = result[:marker_match.start()].strip()
+        final_text = result[marker_match.end():].strip()
+        return {
+            "review": review_text,
+            "final_solution": final_text,
+        }
+
+    # Safe fallback if the model does not include the exact header
+    return {
+        "review": result,
+        "final_solution": state.get("code", ""),
     }
 
-    result = graph.invoke(initial_state)
+
+# ---------- LANGGRAPH ----------
+workflow = StateGraph(CrewState)
+
+workflow.add_node("planner", planner)
+workflow.add_node("developer", developer)
+workflow.add_node("tester", tester)
+workflow.add_node("reviewer", reviewer)
+
+workflow.set_entry_point("planner")
+workflow.add_edge("planner", "developer")
+workflow.add_edge("developer", "tester")
+workflow.add_edge("tester", "reviewer")
+workflow.add_edge("reviewer", END)
+
+graph = workflow.compile()
+
+
+# ---------- FASTAPI ----------
+app = FastAPI(title="AI Dev Crew", version="2.0")
+
+
+class TaskRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=4000)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "app": "AI Dev Crew", "version": "2.0", "model": MODEL}
+
+
+@app.post("/dev-crew")
+async def run_dev_crew(request: TaskRequest):
+    task = request.task.strip()
+
+    if len(task) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Please enter a development task with at least 3 characters.",
+        )
+
+    try:
+        # Run synchronous LangGraph outside the async event loop
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                graph.invoke,
+                {"user_task": task},
+            ),
+            timeout=240,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="The AI workflow timed out. Try a simpler task or check your connection.",
+        )
+    except Exception as exc:
+        print(f"Dev Crew error: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI workflow failed: {str(exc)}",
+        )
 
     return {
         "success": True,
-        "task": user_task,
+        "task": task,
         "plan": result.get("plan", ""),
         "code": result.get("code", ""),
         "tests": result.get("tests", ""),
         "review": result.get("review", ""),
-        "final_solution": result.get(
-            "final_solution",
-            ""
-        )
+        "final_solution": result.get("final_solution", ""),
     }
 
 
-# ============================================================
-# FRONTEND
-# ============================================================
-
+# ---------- SIMPLE FRONTEND ----------
 @app.get("/", response_class=HTMLResponse)
 def home():
-
     return """
 <!DOCTYPE html>
-
-<html>
-
+<html lang="en">
 <head>
-
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Dev Crew</title>
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
+* { box-sizing: border-box; }
 body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-    background: #f5f7fb;
-    color: #111827;
-}
-
-.container {
-    max-width: 1100px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    max-width: 1000px;
     margin: 40px auto;
     padding: 20px;
 }
-
-.header {
-    text-align: center;
-    margin-bottom: 30px;
-}
-
-.header h1 {
-    font-size: 40px;
-    margin-bottom: 10px;
-}
-
-.header p {
-    color: #6b7280;
-    font-size: 17px;
-}
-
+.header { text-align: center; margin-bottom: 30px; }
+.header h1 { font-size: 2.2rem; margin-bottom: 8px; color: #f8fafc; }
+.header p { color: #94a3b8; font-size: 1.05rem; }
+.badge { display: inline-block; padding: 4px 12px; background: #1e293b; border: 1px solid #334155; border-radius: 20px; font-size: 0.85rem; color: #38bdf8; margin-top: 6px; }
 .card {
-    background: white;
-    padding: 30px;
-    border-radius: 18px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+    background: #1e293b;
+    padding: 25px;
+    border-radius: 16px;
+    border: 1px solid #334155;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.3);
 }
-
-label {
-    display: block;
-    font-weight: bold;
-    margin-bottom: 10px;
-}
-
+label { font-weight: 600; font-size: 1.05rem; color: #f1f5f9; display: block; margin-bottom: 10px; }
 textarea {
     width: 100%;
-    min-height: 150px;
-    padding: 15px;
-    border: 1px solid #d1d5db;
+    height: 120px;
+    padding: 14px;
+    font-size: 15px;
+    background: #0f172a;
+    color: #f8fafc;
+    border: 1px solid #475569;
     border-radius: 10px;
-    font-size: 16px;
     resize: vertical;
+    outline: none;
+    transition: border-color 0.2s;
 }
-
+textarea:focus { border-color: #6366f1; }
 button {
     width: 100%;
-    margin-top: 20px;
-    padding: 16px;
-    border: none;
-    border-radius: 12px;
-    background: #4f46e5;
-    color: white;
-    font-size: 18px;
-    font-weight: bold;
-    cursor: pointer;
-}
-
-button:hover {
-    background: #4338ca;
-}
-
-button:disabled {
-    background: #9ca3af;
-}
-
-.loading {
-    display: none;
-    text-align: center;
-    margin-top: 20px;
-    color: #4f46e5;
-    font-weight: bold;
-}
-
-.error {
-    display: none;
-    margin-top: 20px;
     padding: 15px;
-    background: #fee2e2;
-    color: #991b1b;
+    margin-top: 15px;
+    background: linear-gradient(135deg, #4f46e5, #6366f1);
+    color: white;
+    border: 0;
     border-radius: 10px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s, opacity 0.2s;
 }
-
-.results {
-    display: none;
-    margin-top: 30px;
-}
-
-.agent-box {
+button:hover:not(:disabled) { transform: translateY(-1px); }
+button:disabled { opacity: 0.6; cursor: not-allowed; }
+#status { margin-top: 15px; font-weight: 500; min-height: 24px; text-align: center; }
+.agent {
     margin-top: 20px;
     padding: 20px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-    border-radius: 14px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
 }
-
-.agent-box h3 {
+.agent h3 {
     margin-top: 0;
+    margin-bottom: 12px;
+    font-size: 1.15rem;
+    color: #38bdf8;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
-
 .output {
     white-space: pre-wrap;
+    word-break: break-word;
     line-height: 1.6;
-    font-size: 15px;
+    background: #0f172a;
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid #334155;
+    font-family: Consolas, Monaco, "Courier New", monospace;
+    font-size: 14px;
+    color: #f1f5f9;
+    max-height: 500px;
+    overflow-y: auto;
 }
-
-.final {
-    border: 2px solid #4f46e5;
-    background: #eef2ff;
-}
-
 </style>
-
 </head>
-
-
 <body>
-
-<div class="container">
-
 <div class="header">
-
-<h1>🤖 AI Dev Crew</h1>
-
-<p>
-Multi-Agent Software Development using LangGraph
-</p>
-
+    <h1>🤖 AI Dev Crew</h1>
+    <p>Multi-Agent Software Development Squad with LangGraph & Google Gemini</p>
+    <div class="badge">Model: gemini-3.1-flash-lite</div>
 </div>
-
 
 <div class="card">
-
-<form id="devForm">
-
-<label>
-💡 Describe your development task
-</label>
-
-<textarea
-id="task"
-placeholder="Example: Build a FastAPI REST API for a student management system with CRUD operations."
-required
-></textarea>
-
-
-<button
-id="runButton"
-type="submit"
->
-🚀 Start Dev Crew
-</button>
-
-</form>
-
-
-<div
-class="loading"
-id="loading"
->
-⏳ Dev Crew is working... Planner → Developer → Tester → Reviewer
+    <label for="task">Describe your development task</label>
+    <textarea id="task" placeholder="e.g. Build a Python CLI password manager using SQLite and cryptography">Build a FastAPI student CRUD API using SQLite</textarea>
+    <button id="run" onclick="runCrew()">🚀 Start Dev Crew</button>
+    <div id="status"></div>
 </div>
 
-
-<div
-class="error"
-id="error"
-></div>
-
-
-<div
-class="results"
-id="results"
->
-
-<div class="agent-box">
-
-<h3>🧠 Planner Agent</h3>
-
-<div
-class="output"
-id="plan"
-></div>
-
+<div id="results" hidden>
+    <div class="agent"><h3>🧠 Agent 1: Planner</h3><div class="output" id="plan"></div></div>
+    <div class="agent"><h3>💻 Agent 2: Developer</h3><div class="output" id="code"></div></div>
+    <div class="agent"><h3>🧪 Agent 3: Tester</h3><div class="output" id="tests"></div></div>
+    <div class="agent"><h3>🔍 Agent 4: Reviewer</h3><div class="output" id="review"></div></div>
+    <div class="agent"><h3>🚀 Final Solution</h3><div class="output" id="final_solution"></div></div>
 </div>
-
-
-<div class="agent-box">
-
-<h3>💻 Developer Agent</h3>
-
-<div
-class="output"
-id="code"
-></div>
-
-</div>
-
-
-<div class="agent-box">
-
-<h3>🧪 Tester Agent</h3>
-
-<div
-class="output"
-id="tests"
-></div>
-
-</div>
-
-
-<div class="agent-box">
-
-<h3>🔍 Reviewer Agent</h3>
-
-<div
-class="output"
-id="review"
-></div>
-
-</div>
-
-
-<div class="agent-box final">
-
-<h3>🚀 Final Solution</h3>
-
-<div
-class="output"
-id="finalSolution"
-></div>
-
-</div>
-
-</div>
-
-</div>
-
-</div>
-
 
 <script>
+async function runCrew() {
+    const task = document.getElementById("task").value.trim();
+    const btn = document.getElementById("run");
+    const status = document.getElementById("status");
+    const results = document.getElementById("results");
 
-const form =
-document.getElementById("devForm");
-
-const button =
-document.getElementById("runButton");
-
-const loading =
-document.getElementById("loading");
-
-const errorBox =
-document.getElementById("error");
-
-const results =
-document.getElementById("results");
-
-
-form.addEventListener(
-"submit",
-async function(event) {
-
-    event.preventDefault();
-
-    const task =
-    document.getElementById("task").value.trim();
-
-    if (!task) {
+    if (task.length < 3) {
+        status.innerHTML = "<span style='color:#f87171'>⚠️ Enter a task with at least 3 characters.</span>";
         return;
     }
 
-    button.disabled = true;
-
-    button.innerText =
-    "⏳ Dev Crew Running...";
-
-    loading.style.display =
-    "block";
-
-    errorBox.style.display =
-    "none";
-
-    results.style.display =
-    "none";
-
+    btn.disabled = true;
+    status.innerHTML = "<span style='color:#38bdf8'>⏳ Agents are planning, writing code, testing, and reviewing... Please wait.</span>";
+    results.hidden = true;
 
     try {
+        const response = await fetch("/dev-crew", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ task })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "Request failed");
 
-        const response =
-        await fetch(
-            "/dev-crew",
-            {
-                method: "POST",
-
-                headers: {
-                    "Content-Type":
-                    "application/json"
-                },
-
-                body: JSON.stringify({
-                    task: task
-                })
-            }
-        );
-
-
-        const data =
-        await response.json();
-
-
-        if (!response.ok ||
-            !data.success) {
-
-            throw new Error(
-                data.error ||
-                "Something went wrong."
-            );
-
+        for (const key of ["plan", "code", "tests", "review", "final_solution"]) {
+            document.getElementById(key).textContent = data[key] || "No output returned.";
         }
-
-
-        document.getElementById(
-            "plan"
-        ).innerText =
-        data.plan;
-
-
-        document.getElementById(
-            "code"
-        ).innerText =
-        data.code;
-
-
-        document.getElementById(
-            "tests"
-        ).innerText =
-        data.tests;
-
-
-        document.getElementById(
-            "review"
-        ).innerText =
-        data.review;
-
-
-        document.getElementById(
-            "finalSolution"
-        ).innerText =
-        data.final_solution;
-
-
-        results.style.display =
-        "block";
-
-
-    } catch (error) {
-
-        errorBox.innerText =
-        "❌ " + error.message;
-
-        errorBox.style.display =
-        "block";
-
+        results.hidden = false;
+        status.innerHTML = "<span style='color:#4ade80'>✅ Dev Crew workflow completed successfully!</span>";
+    } catch (e) {
+        status.innerHTML = "<span style='color:#f87171'>❌ " + e.message + "</span>";
+    } finally {
+        btn.disabled = false;
     }
-
-
-    loading.style.display =
-    "none";
-
-    button.disabled =
-    false;
-
-    button.innerText =
-    "🚀 Start Dev Crew";
-
-});
-
+}
 </script>
-
 </body>
-
 </html>
 """
 
 
-# ============================================================
-# RUN
-# ============================================================
+# ---------- CLI EXECUTION ----------
+def run_cli(task: str):
+    print("\n" + "=" * 70)
+    print("🚀 AI DEV CREW - RUNNING LIVE WORKFLOW")
+    print(f"📌 Task: {task}")
+    print(f"🤖 Model: {MODEL}")
+    print("=" * 70)
+
+    try:
+        final_state = graph.invoke({"user_task": task})
+        print("\n" + "=" * 70)
+        print("✅ WORKFLOW COMPLETE!")
+        print("=" * 70)
+        return final_state
+    except Exception as e:
+        print(f"\n❌ Execution error: {e}")
+        return None
+
 
 if __name__ == "__main__":
+    server_flags = {"--server", "--serve", "-s", "server", "serve"}
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    # If flags match server flags, or if no arguments are passed, start web server
+    if len(sys.argv) == 1 or any(arg in server_flags for arg in sys.argv[1:]):
+        port = int(os.getenv("PORT", "8000"))
+        print(f"🚀 AI Dev Crew web server starting on http://localhost:{port}")
+        uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        task_input = " ".join(sys.argv[2:]) if len(sys.argv) > 2 else "Build a Python utility to validate and sanitize email addresses"
+        run_cli(task_input)
+    else:
+        # User passed a custom task string directly, e.g. python main.py "task description"
+        task_input = " ".join(sys.argv[1:])
+        run_cli(task_input)
