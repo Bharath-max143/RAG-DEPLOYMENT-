@@ -28,7 +28,7 @@ from langgraph.graph import StateGraph, END
 # ---------- CONFIG ----------
 # Set GOOGLE_API_KEY in your .env file or deployment environment.
 # Never hard-code API keys in source code.
-API_KEY = os.getenv("GOOGLE_API_KEY", "").strip().strip()
+API_KEY = os.getenv("AQ.Ab8RN6JrvCpgQt5md4rw9ZounGOuD9FVS9BbveST4eI472VBvA", "").strip().strip()
 if not API_KEY:
     raise RuntimeError(
         "GOOGLE_API_KEY is missing. Add it to your .env file or deployment secrets."
